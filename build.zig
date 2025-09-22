@@ -35,6 +35,12 @@ pub fn build(b: *std.Build) !void {
         return;
     }
 
+    // exercise z80 executable
+    const exercise = b.addExecutable(.{ .name = "exercise_z80", .root_source_file = b.path("src/exercise_z80.zig"), .optimize = optimize, .target = target });
+    const exercise_step = b.step("exercise", "Build exercise");
+    const install_exercise = b.addInstallArtifact(exercise, .{});
+    exercise_step.dependOn(&install_exercise.step);
+
     const exe = b.addExecutable(.{ .name = "80", .root_source_file = b.path("src/z80.zig"), .optimize = optimize, .target = target });
 
     exe.linkLibrary(raylib_artifact);
