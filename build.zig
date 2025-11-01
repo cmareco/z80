@@ -35,32 +35,64 @@ pub fn build(b: *std.Build) !void {
         return;
     }
 
-    // exercise z80 executable
-    const exercise = b.addExecutable(.{ .name = "exercise_z80", .root_source_file = b.path("src/exercise_z80.zig"), .optimize = optimize, .target = target });
-    const exercise_step = b.step("exercise", "Build exercise");
-    const install_exercise = b.addInstallArtifact(exercise, .{});
-    exercise_step.dependOn(&install_exercise.step);
+    // // exercise z80 executable
+    // const exercise = b.addExecutable(.{ .name = "exercise_z80", .root_source_file = b.path("src/exercise_z80.zig"), .optimize = optimize, .target = target });
+    // const exercise_step = b.step("exercise", "Build exercise");
+    // const install_exercise = b.addInstallArtifact(exercise, .{});
+    // exercise_step.dependOn(&install_exercise.step);
 
-    const exe = b.addExecutable(.{ .name = "80", .root_source_file = b.path("src/z80.zig"), .optimize = optimize, .target = target });
+    // const exe = b.addExecutable(.{ .name = "80", .root_source_file = b.path("src/z80.zig"), .optimize = optimize, .target = target });
 
-    exe.linkLibrary(raylib_artifact);
-    exe.root_module.addImport("raylib", raylib);
+    // exe.linkLibrary(raylib_artifact);
+    // exe.root_module.addImport("raylib", raylib);
 
-    const run_cmd = b.addRunArtifact(exe);
-    const run_step = b.step("run", "Run z80");
-    run_step.dependOn(&run_cmd.step);
+    // const run_cmd = b.addRunArtifact(exe);
+    // const run_step = b.step("run", "Run z80");
+    // run_step.dependOn(&run_cmd.step);
 
-    b.installArtifact(exe);
+    // b.installArtifact(exe);
 
-    // z80 executable
-    const z80_exe = b.addExecutable(.{ .name = "z80", .root_source_file = b.path("./src/z80.zig"), .optimize = optimize, .target = target });
-    const z80_run_cmd = b.addRunArtifact(z80_exe);
-    const z80_run_step = b.step("run_z80", "z80");
-    z80_run_step.dependOn(&z80_run_cmd.step);
-    b.installArtifact(z80_exe);
+    // // z80 executable
+    // const z80_exe = b.addExecutable(.{ .name = "z80", .root_source_file = b.path("./src/z80.zig"), .optimize = optimize, .target = target });
+    // const z80_run_cmd = b.addRunArtifact(z80_exe);
+    // const z80_run_step = b.step("run_z80", "z80");
+    // z80_run_step.dependOn(&z80_run_cmd.step);
+    // b.installArtifact(z80_exe);
 
-    const z80 = b.addExecutable(.{ .name = "z80", .root_source_file = b.path("src/z80.zig"), .optimize = optimize, .target = target });
-    const z80_step = b.step("z80", "Build z80");
-    const install_z80 = b.addInstallArtifact(z80, .{});
-    z80_step.dependOn(&install_z80.step);
+    // const z80 = b.addExecutable(.{ .name = "z80", .root_source_file = b.path("src/z80.zig"), .optimize = optimize, .target = target });
+    // const z80_step = b.step("z80", "Build z80");
+    // const install_z80 = b.addInstallArtifact(z80, .{});
+    // z80_step.dependOn(&install_z80.step);
+
+    // pacman executable
+    const pacman = b.addExecutable(.{ .name = "pacman", .root_source_file = b.path("src/pacman.zig"), .optimize = optimize, .target = target });
+    pacman.linkLibrary(raylib_artifact);
+    pacman.root_module.addImport("raylib", raylib);
+
+    const pacman_step = b.step("pacman", "Build exercise");
+    const install_pacman = b.addInstallArtifact(pacman, .{});
+    pacman_step.dependOn(&install_pacman.step);
+
+    const pacman_exe = b.addExecutable(.{ .name = "pacman.exe", .root_source_file = b.path("src/pacman.zig"), .optimize = optimize, .target = target });
+
+    const pacman_run_cmd = b.addRunArtifact(pacman_exe);
+    const pacman_run_step = b.step("run_pacman", "Run pacman");
+    pacman_run_step.dependOn(&pacman_run_cmd.step);
+
+    b.installArtifact(pacman_exe);
+
+    const sp = b.addExecutable(.{ .name = "sp", .root_source_file = b.path("src/sp.zig"), .optimize = optimize, .target = target });
+    sp.linkLibrary(raylib_artifact);
+    sp.root_module.addImport("raylib", raylib);
+
+    const sp_step = b.step("sp", "Build sp");
+    const install_sp = b.addInstallArtifact(sp, .{});
+    sp_step.dependOn(&install_sp.step);
+
+    const sp_exe = b.addExecutable(.{ .name = "sp.exe", .root_source_file = b.path("src/sp.zig"), .optimize = optimize, .target = target });
+    const sp_run_cmd = b.addRunArtifact(sp_exe);
+    const sp_run_step = b.step("run_sp", "Run sp");
+    sp_run_step.dependOn(&sp_run_cmd.step);
+
+    b.installArtifact(sp_exe);
 }

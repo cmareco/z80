@@ -31,9 +31,8 @@ pub const z80 = struct {
     running_state: run_state = .running,
 
     // interrupts
-    inte: u1 = 0, // interrupt enable bit
-    interrupt_req: u1 = 0, // interrupt request signal
-    interrupt_delay: u4 = 0, // ??
+    maskable_int_req: u1 = 0, // interrupt request signal
+    non_maskable_int_req: u1 = 0, // non-maskable interrupt request signal
     interrupt_vector: u8 = 0, // opcode provided by interrupt req
 
     iff1: u1 = 0,
@@ -45,11 +44,15 @@ pub const z80 = struct {
 
     cycles: u32 = 0,
 
-    pub const register_pairs = enum(u2) {
+    pub const register_pairs = enum(u4) {
         BC = 0,
         DE = 1,
         HL = 2,
         AF = 3,
+        BC_ = 4,
+        DE_ = 5,
+        HL_ = 6,
+        AF_ = 7,
     };
 
     pub const flag_bits = packed struct { c: u1, n: u1, pv: u1, x1: u1, h: u1, x2: u1, z: u1, s: u1 };
@@ -306,11 +309,15 @@ pub const z80 = struct {
             .DE => get_word_from_bytes(self.d, self.e),
             .HL => get_word_from_bytes(self.h, self.l),
             .AF => get_word_from_bytes(self.a, self.f.byte),
+            .BC_ => get_word_from_bytes(self.b_, self.c_),
+            .DE_ => get_word_from_bytes(self.d_, self.e_),
+            .HL_ => get_word_from_bytes(self.h_, self.l_),
+            .AF_ => get_word_from_bytes(self.a_, self.f_),
         };
     }
 
     // sets the contents of a register pair (0-3)
-    fn set_register_pair(self: *z80, reg_pair: z80.register_pairs, value: u16) void {
+    pub fn set_register_pair(self: *z80, reg_pair: z80.register_pairs, value: u16) void {
         //const temp = value >> 8;
         const byte1: u8 = @truncate(value >> 8);
         const byte2: u8 = @truncate(value & 0x00FF);
@@ -330,6 +337,22 @@ pub const z80 = struct {
             .AF => {
                 self.a = byte1;
                 self.f.byte = byte2;
+            },
+            .BC_ => {
+                self.b_ = byte1;
+                self.c_ = byte2;
+            },
+            .DE_ => {
+                self.d_ = byte1;
+                self.e_ = byte2;
+            },
+            .HL_ => {
+                self.h_ = byte1;
+                self.l_ = byte2;
+            },
+            .AF_ => {
+                self.a_ = byte1;
+                self.f_ = byte2;
             },
         }
     }
@@ -366,6 +389,14 @@ pub const z80 = struct {
         self.f.bits.z = if (value == 0) 1 else 0;
         self.f.bits.s = if (value & 0x80 != 0) 1 else 0;
         self.f.bits.pv = if (@popCount(value) & 1 == 0) 1 else 0; // Even parity
+    }
+
+    fn set_pv_addition(self: *z80, orig: u8, value: u8, result: u8) void {
+        self.f.bits.pv = if (((orig ^ ~value) & (orig ^ result) & 0x80) != 0) 1 else 0;
+    }
+
+    fn set_pv_subtraction(self: *z80, orig: u8, value: u8, result: u8) void {
+        self.f.bits.pv = if (((orig ^ value) & (orig ^ result) & 0x80) != 0) 1 else 0;
     }
 
     // calc carry between bit_no and bit_no - 1
@@ -409,14 +440,17 @@ pub const z80 = struct {
                 // LD (HL), r
                 ram[H] = self.get_register(src);
             }
-        } else // LD r, r
-        self.set_register(dst, self.get_register(src));
+        } else { // LD r, r
+            self.set_register(dst, self.get_register(src));
+        }
     }
 
     // LD_RP_NN
     fn load_immediate_16bit(self: *z80, opcode: z80.opcodes, ram: []u8) void {
         const lo = ram[self.pc];
-        const hi = ram[self.pc + 1];
+        const hi = ram[
+            self.pc +% 1
+        ];
         const word = get_word_from_bytes(hi, lo);
 
         switch (opcode) {
@@ -504,6 +538,8 @@ pub const z80 = struct {
         const result = HL +% value;
         self.set_register_pair(.HL, result);
         self.f.bits.c = if (result < HL) 1 else 0; // Set carry if overflow
+        self.f.bits.h = if (((HL & 0x0FFF) + (value & 0x0FFF)) > 0x0FFF) 1 else 0; // Check for half-carry
+        self.f.bits.n = 0; // ADD clears N flag
     }
 
     // ADD and ADC
@@ -526,7 +562,22 @@ pub const z80 = struct {
         self.set_zsp(result_u8);
         self.f.bits.c = z80.calc_carry(8, self.a, value, carry_in);
         self.f.bits.h = z80.calc_carry(4, self.a, value, carry_in);
+        self.f.bits.n = 0; // ADD/ADC clears N flag
+        self.set_pv_addition(self.a, value, result_u8);
+        self.a = result_u8; // Store result in accumulator
+    }
 
+    fn subtract(self: *z80, value: u8, with_borrow: bool) void {
+        const borrow_in: u8 = if (with_borrow) self.f.bits.c else 0;
+        const result = @as(u16, self.a) -% (@as(u16, value) +% @as(u16, borrow_in));
+        const result_u8: u8 = @truncate(result);
+
+        // Set flags
+        self.set_zsp(result_u8);
+        self.f.bits.c = if (result > 0xFF) 1 else 0; // Set carry if underflow
+        self.f.bits.h = if (((self.a & 0x0F) < ((value & 0x0F) + borrow_in))) 1 else 0; // Correct half-borrow calculation
+        self.set_pv_subtraction(self.a, value, result_u8);
+        self.f.bits.n = 1; // SUB/SBB sets N flag
         self.a = result_u8; // Store result in accumulator
     }
 
@@ -542,15 +593,14 @@ pub const z80 = struct {
             value = self.get_register(reg);
         }
 
-        const borrow_in: u8 = if (with_borrow) self.f.bits.c else 0;
-        const result = @as(u16, self.a) -% (@as(u16, value) +% @as(u16, borrow_in));
-        const result_u8: u8 = @truncate(result);
+        self.subtract(value, with_borrow);
+    }
 
-        // Set flags
-        self.set_zsp(result_u8);
-        self.f.bits.c = if (result > 0xFF) 1 else 0; // Set carry if underflow
-        self.f.bits.h = if (((self.a & 0x0F) < ((value & 0x0F) + borrow_in))) 1 else 0; // Correct half-borrow calculation
-        self.a = result_u8; // Store result in accumulator
+    // SBC A (HL)
+    fn sbc_a_hl(self: *z80, ram: []u8, with_borrow: bool) void {
+        const addr = self.get_register_pair(.HL);
+        const value = ram[addr];
+        self.subtract(value, with_borrow);
     }
 
     // ANA, XRA, ORA
@@ -569,8 +619,8 @@ pub const z80 = struct {
         switch (opcode) {
             .AND_B, .AND_C, .AND_D, .AND_E, .AND_H, .AND_L, .AND__HL_, .AND_A => {
                 self.a = self.a & value; // AND operation
-                self.f.bits.h = if (((self.a | value) & 0x08) != 0) 1 else 0;
-                //self.f.bits.h = if ((self.a & 0x0F) < (value & 0x0F)) 1 else 0; // Check for half-carry
+                //self.f.bits.h = if (((self.a | value) & 0x08) != 0) 1 else 0;
+                self.f.bits.h = 1;
             },
             .XOR_B, .XOR_C, .XOR_D, .XOR_E, .XOR_H, .XOR_L, .XOR__HL_, .XOR_A => {
                 // XOR operation
@@ -586,30 +636,61 @@ pub const z80 = struct {
         // Set flags
         self.set_zsp(self.a);
         self.f.bits.c = 0; // No carry for logical operations
+        self.f.bits.n = 0; // Logical operations clear N flag
     }
 
     // DAA
+    // copied from stack overflow: https://stackoverflow.com/questions/8119577/z80-daa-instruction
     fn daa(self: *z80) void {
-        const lsb = self.a & 0x0F;
-        const a_orig = self.a;
-        var correction: u8 = 0;
+        var t: u8 = 0;
 
-        if (lsb > 9 or self.f.bits.h == 1) {
-            self.a += 6;
-            correction += 6;
+        if (self.f.bits.h == 1 or (self.a & 0x0F) > 9) {
+            t = t + 1;
+        }
+        if (self.f.bits.c == 1 or self.a > 0x99) {
+            t = t + 2;
+            self.f.bits.c = 1;
         }
 
-        const msb = (self.a & 0xF0) >> 4;
-        if (msb > 9 or self.f.bits.c == 1) {
-            self.a = (self.a +% 0x60);
-            correction += 0x60;
+        if (self.f.bits.n == 1 and self.f.bits.h == 0) {
+            self.f.bits.h = 0;
+        } else {
+            if (self.f.bits.n == 1 and self.f.bits.h == 1) {
+                self.f.bits.h = if (self.a & 0x0F < 0x06) 1 else 0;
+            } else self.f.bits.h = if (self.a & 0x0F >= 0x0A) 1 else 0;
         }
 
-        // set flags
+        switch (t) {
+            1 => self.a +%= if (self.f.bits.n == 1) 0xFA else 0x06,
+            2 => self.a +%= if (self.f.bits.n == 1) 0xA0 else 0x60,
+            3 => self.a +%= if (self.f.bits.n == 1) 0x9A else 0x66,
+            else => {},
+        }
         self.set_zsp(self.a);
-        self.f.bits.c = calc_carry(8, a_orig, correction, 0);
-        self.f.bits.h = calc_carry(4, a_orig, correction, 0);
     }
+
+    // DAA
+    // fn daa(self: *z80) void {
+    //     const lsb = self.a & 0x0F;
+    //     const a_orig = self.a;
+    //     var correction: u8 = 0;
+
+    //     if (lsb > 9 or self.f.bits.h == 1) {
+    //         self.a = self.a +% 6;
+    //         correction +%= 6;
+    //     }
+
+    //     const msb = (self.a & 0xF0) >> 4;
+    //     if (msb > 9 or self.f.bits.c == 1) {
+    //         self.a = (self.a +% 0x60);
+    //         correction +%= 0x60;
+    //     }
+
+    //     // set flags
+    //     self.set_zsp(self.a);
+    //     self.f.bits.c = calc_carry(8, a_orig, correction, 0);
+    //     self.f.bits.h = calc_carry(4, a_orig, correction, 0);
+    // }
 
     //*************************************************************************
     //
@@ -707,7 +788,7 @@ pub const z80 = struct {
             unreachable; // Invalid type
         }
         // set shifted value back to memory always
-        if (reg != 0b110) // if a register was specified, set it too
+        if (reg == 0b110) // if a register was specified, set it too
             ram[self.get_register_pair(.HL)] = value
         else
             self.set_register(reg, value);
@@ -760,6 +841,13 @@ pub const z80 = struct {
                 self.f.bits.z = if (ram[addr] & bit == 0) 1 else 0;
                 self.f.bits.h = 1;
                 self.f.bits.n = 0;
+
+                const bit_mask: u8 = @as(u8, 1) << bit_no;
+                self.f.bits.z = if ((ram[addr] & bit_mask) == 0) 1 else 0; // Set zero flag if bit 0 is 0
+                self.f.bits.pv = self.f.bits.z; // Parity flag mirrors zero flag for bit test
+                self.f.bits.s = if (bit_no == 7 and self.f.bits.z == 0) 1 else 0; // Sign flag set if bit 7 is tested and is 1
+                self.f.bits.h = 1; // Set half-carry flag
+                self.f.bits.n = 0; // No subtraction for bit test
             },
             0x80...0xBF => // RES
             {
@@ -826,6 +914,8 @@ pub const z80 = struct {
                     self.get_register(reg_no);
                 const bit_mask: u8 = @as(u8, 1) << bit_no;
                 self.f.bits.z = if ((value & bit_mask) == 0) 1 else 0; // Set zero flag if bit 0 is 0
+                self.f.bits.pv = self.f.bits.z; // Parity flag mirrors zero flag for bit test
+                self.f.bits.s = if (bit_no == 7 and self.f.bits.z == 0) 1 else 0; // Sign flag set if bit 7 is tested and is 1
                 self.f.bits.h = 1; // Set half-carry flag
                 self.f.bits.n = 0; // No subtraction for bit test
             },
@@ -910,9 +1000,9 @@ pub const z80 = struct {
                 self.f.bits.h = if (((HL & 0x0FFF) < ((value & 0x0FFF) + borrow_in))) 1 else 0; // Check for half-borrow
                 self.f.bits.n = 1; // Set subtraction flag
                 const high: u8 = @truncate(result >> 8);
-                self.f.bits.s = if ((high & 0x80) != 0) 1 else 0;
-                self.f.bits.z = if (high == 0) 1 else 0; // Overflow (P/V): set if signed overflow
-                //self.f.bits.pv = if (result > std.math.maxInt(i16) or result < std.math.minInt(i16)) 1 else 0;
+                self.set_zsp(high);
+                self.f.bits.z = if (result == 0) 1 else 0; // z flag based on full 16-bit result
+
                 const HLs = @as(i32, (HL));
                 const vals = @as(i32, (value));
                 const ress = @as(i32, (result));
@@ -939,17 +1029,19 @@ pub const z80 = struct {
                 self.f.bits.n = 0; // Clear subtraction flag
                 const high: u8 = @truncate(result >> 8);
                 self.f.bits.s = if ((high & 0x80) != 0) 1 else 0;
-                self.f.bits.z = if (high == 0) 1 else 0;
+                self.f.bits.z = if (result == 0) 1 else 0;
                 // Overflow (P/V): set if signed overflow
                 const HLs = @as(i32, (HL));
                 const vals = @as(i32, (value));
                 const ress = @as(i32, (result));
-                self.f.bits.pv = if (((HLs ^ vals) & (HLs ^ ress) & 0x8000) != 0) 1 else 0;
+                self.f.bits.pv = if (((HLs ^ ~vals) & (HLs ^ ress) & 0x8000) != 0) 1 else 0;
             },
 
             .LD_BC__NN_, .LD_DE__NN_, .LD_HL__NN_, .LD_SP__NN_ => {
                 // Load immediate value into register pairs
-                const addr = get_word_from_bytes(ram[self.pc], ram[self.pc + 1]);
+                const addr = get_word_from_bytes(ram[self.pc +% 1], ram[
+                    self.pc
+                ]);
                 self.pc = self.pc +% 2;
                 // Increment PC by 1 to account for the low byte of the address
                 const value = get_word_from_bytes(ram[addr + 1], ram[addr]);
@@ -964,7 +1056,7 @@ pub const z80 = struct {
             },
 
             .LD__NN__BC, .LD__NN__DE, .LD__NN__HL, .LD__NN__SP => {
-                const addr = get_word_from_bytes(ram[self.pc], ram[self.pc + 1]);
+                const addr = get_word_from_bytes(ram[self.pc +% 1], ram[self.pc]);
                 self.pc = self.pc +% 2;
                 // Increment PC by 1 to account for the low byte of the address
                 const value = switch (opcode) {
@@ -980,11 +1072,12 @@ pub const z80 = struct {
 
             .NEG => {
                 // Negate the accumulator
-                self.a = ~self.a;
+                const orig = self.a;
+                self.a = ~self.a +% 1;
                 self.set_zsp(self.a);
                 self.f.bits.c = if (self.a == 0) 0 else 1; // Set carry if result is non-zero
-                self.f.bits.h = 1; // Set half-carry
-                self.f.bits.h = if (((self.a & 0x0F) < (0 & 0x0F))) 1 else 0; // Correct half-borrow calculation
+                self.f.bits.h = if (((0 & 0x0F) < ((self.a & 0x0F) + 0))) 1 else 0; // Correct half-borrow calculation
+                self.f.bits.pv = if (orig == 0x80) 1 else 0; // Overflow occurs if original A was 0x80
                 self.f.bits.n = 1; // Set subtraction flag
             },
 
@@ -992,7 +1085,7 @@ pub const z80 = struct {
                 // Return from interrupt
                 const return_address = self.pop(ram[0..]);
                 self.pc = return_address;
-                self.iff2 = self.iff1; // Restore interrupt flags
+                self.iff1 = self.iff2; // Restore interrupt flags
             },
 
             .RETI => {
@@ -1086,10 +1179,10 @@ pub const z80 = struct {
 
                 self.set_register_pair(.HL, addr_hl - 1); // Increment HL
                 self.set_register_pair(.DE, addr_de - 1); // Increment DE
-                self.set_register_pair(.BC, self.get_register_pair(.BC) + 1); // Increment DE
+                self.set_register_pair(.BC, self.get_register_pair(.BC) -% 1); // Increment DE
                 self.f.bits.n = 0;
                 self.f.bits.h = 0;
-                self.f.bits.pv = if (self.get_register_pair(.BC) - 1 != 0) 1 else 0; // Set parity flag if BC != 0
+                self.f.bits.pv = if (self.get_register_pair(.BC) -% 1 != 0) 1 else 0; // Set parity flag if BC != 0
 
                 if (opcode == .LDDR and self.get_register_pair(.BC) != 0) {
                     self.pc -= 2; // repeat until BC is zero
@@ -1101,11 +1194,11 @@ pub const z80 = struct {
                 const value = ram[addr_hl];
                 self.set_register_pair(.HL, addr_hl + 1); // Increment HL
                 self.set_register_pair(.BC, self.get_register_pair(.BC) - 1); // Increment DE
-                self.set_zsp(self.a);
+                self.set_zsp(self.a -% value);
                 self.f.bits.n = 1;
                 self.f.bits.h = if ((self.a & 0x0F) < (value & 0x0F)) 1 else 0; // Correct half-borrow calculation
                 self.f.bits.pv = if (self.get_register_pair(.BC) - 1 != 0) 1 else 0; // Set parity flag if BC != 0
-
+                self.f.bits.s = if ((self.a -% value) & 0x80 != 0) 1 else 0; // Set sign flag based on result
                 if (opcode == .CPIR and self.get_register_pair(.BC) != 0 and self.a != value) {
                     self.pc -= 2; // repeat until BC is zero
                 }
@@ -1116,11 +1209,11 @@ pub const z80 = struct {
                 const addr_hl = self.get_register_pair(.HL);
                 const value = ram[addr_hl];
                 self.set_register_pair(.HL, addr_hl - 1); // Increment HL
-                self.set_register_pair(.BC, self.get_register_pair(.BC) - 1); // Increment DE
-                self.set_zsp(self.a - value);
+                self.set_register_pair(.BC, self.get_register_pair(.BC) -% 1); // Increment DE
+                self.set_zsp(self.a -% value);
                 self.f.bits.n = 1;
                 self.f.bits.h = if ((self.a & 0x0F) < (value & 0x0F)) 1 else 0; // Correct half-borrow calculation
-                self.f.bits.pv = if (self.get_register_pair(.BC) - 1 != 0) 1 else 0; // Set parity flag if BC != 0
+                self.f.bits.pv = if (self.get_register_pair(.BC) -% 1 != 0) 1 else 0; // Set parity flag if BC != 0
 
                 if (opcode == .CPDR and self.get_register_pair(.BC) != 0 and self.a != value) {
                     self.pc -= 2; // repeat until BC is zero
@@ -1135,8 +1228,8 @@ pub const z80 = struct {
                 self.set_register_pair(.HL, addr_hl + 1); // Increment HL
                 self.b = self.b -% 1; // Decrement B
                 self.f.bits.n = 1;
-                self.f.bits.h = 0;
-                self.f.bits.z = if (self.b - 1 == 0) 1 else 0; // Set parity flag if B != 0
+                //self.f.bits.h = 0;
+                self.f.bits.z = if (self.b -% 1 == 0) 1 else 0; // Set parity flag if B != 0
 
                 if (opcode == .INIR and self.b != 0) {
                     self.pc -= 2; // repeat until B is zero
@@ -1207,14 +1300,60 @@ pub const z80 = struct {
                 self.load_immediate_8bit(instruction, ram[0..]);
             },
 
+            .LD_B_IXH, .LD_B_IXL, .LD_C_IXH, .LD_C_IXL, .LD_D_IXH, .LD_D_IXL, .LD_E_IXH, .LD_E_IXL, .LD_A_IXH, .LD_A_IXL => {
+                // undocumented instructions
+                // --rrr-xx -> rrr = register, xx = hi (00) or lo (01)
+                const reg: u8 = @truncate((instruction & 0b00111000) >> 3);
+                const value: u8 = if ((instruction & 0b00000011) == 0b00)
+                    @truncate((self.ix & 0xFF00) >> 8) // IXH
+                else
+                    @truncate(self.ix & 0x00FF); // IXL
+                self.set_register(reg, value);
+            },
+            // ---xxrrr
+            // 01100000, 01100001, 01100010, 01100011, 01100111
+            // 01101000, 01101001, 01101010, 01101011, 01101111
+            .LD_IXH_B, .LD_IXH_C, .LD_IXH_D, .LD_IXH_E, .LD_IXH_A, .LD_IXL_B, .LD_IXL_C, .LD_IXL_D, .LD_IXL_E, .LD_IXL_A => {
+                // undocumented instructions
+                // @@@xxrrr -> rrr = register, xx = hi (00) or lo (01)
+                const reg: u8 = @truncate((instruction & 0b00000111));
+                const value: u8 = self.get_register(reg);
+                if ((instruction & 0b00011000) == 0b00) {
+                    // IXH
+                    self.ix = (self.ix & 0x00FF) | (@as(u16, value) << 8);
+                } else {
+                    // IXL
+                    self.ix = (self.ix & 0xFF00) | @as(u16, value);
+                }
+            },
+
+            .LD_IXH_IXH, .LD_IXL_IXL => {
+                return;
+            },
+
+            .LD_IXH_IXL => {
+                //const ixh: u8 = @truncate((self.ix & 0xFF00) >> 8);
+                const ixl: u8 = @truncate(self.ix & 0x00FF);
+                self.ix = (@as(u16, ixl) << 8) | @as(u16, ixl);
+            },
+
+            .LD_IXL_IXH => {
+                const ixh: u8 = @truncate((self.ix & 0xFF00) >> 8);
+                //const ixl: u8 = @truncate(self.ix & 0x00FF);
+                self.ix = (@as(u16, ixh)) | (@as(u16, ixh) << 8);
+            },
+
             .INC_IXH, .INC_IXL => {
                 var value: u8 = undefined;
+                var orig_ix: u8 = undefined;
                 if (opcode == .INC_IXH) {
                     value = @truncate((self.ix & 0xFF00) >> 8);
+                    orig_ix = value;
                     value = value +% 1;
                     self.ix = (self.ix & 0x00FF) | (@as(u16, value) << 8);
                 } else {
                     value = @truncate(self.ix & 0x00FF);
+                    orig_ix = value;
                     value = value +% 1;
                     self.ix = (self.ix & 0xFF00) | @as(u16, value);
                 }
@@ -1222,16 +1361,20 @@ pub const z80 = struct {
                 self.set_zsp(value);
                 self.f.bits.h = if ((value & 0x0F) == 0x00) 1 else 0; // Check for half-carry
                 self.f.bits.n = 0; // Clear subtraction flag
+                self.set_pv_addition(orig_ix, 1, value);
             },
 
             .DEC_IXH, .DEC_IXL => {
                 var value: u8 = undefined;
+                var orig_ix: u8 = undefined;
                 if (opcode == .DEC_IXH) {
                     value = @truncate((self.ix & 0xFF00) >> 8);
+                    orig_ix = value;
                     value = value -% 1;
                     self.ix = (self.ix & 0x00FF) | (@as(u16, value) << 8);
                 } else {
                     value = @truncate(self.ix & 0x00FF);
+                    orig_ix = value;
                     value = value -% 1;
                     self.ix = (self.ix & 0xFF00) | @as(u16, value);
                 }
@@ -1239,6 +1382,17 @@ pub const z80 = struct {
                 self.set_zsp(value);
                 self.f.bits.h = if ((value & 0x0F) == 0x0F) 1 else 0; // Check for half-borrow
                 self.f.bits.n = 1; // Set subtraction flag
+                self.set_pv_subtraction(orig_ix, 1, value);
+            },
+
+            .LD_IXH_N, .LD_IXL_N => {
+                const value = ram[self.pc];
+                self.pc = self.pc +% 1;
+                if (opcode == .LD_IXH_N) {
+                    self.ix = (self.ix & 0x00FF) | (@as(u16, value) << 8);
+                } else {
+                    self.ix = (self.ix & 0xFF00) | @as(u16, value);
+                }
             },
 
             .ADD_IX_BC, .ADD_IX_DE, .ADD_IX_IX, .ADD_IX_SP => {
@@ -1250,24 +1404,27 @@ pub const z80 = struct {
                     else => unreachable,
                 };
                 const IX = self.ix;
-                const result = IX +% value;
-                self.ix = result;
+                const result: u18 = @as(u18, IX) +% @as(u18, value);
+                self.ix = @truncate(result & 0xFFFF);
                 self.f.bits.c = if (result > 0xFFFF) 1 else 0; // Set carry if overflow
                 self.f.bits.h = if (((IX & 0x0FFF) + (value & 0x0FFF)) > 0x0FFF) 1 else 0; // Check for half-carry
                 self.f.bits.n = 0; // Clear subtraction flag
-                self.set_zsp(@truncate(result & 0xFF)); // Set ZSP based on lower byte of result
             },
 
             .LD_IX_NN => {
                 const low_byte = ram[self.pc];
-                const high_byte = ram[self.pc + 1];
+                const high_byte = ram[
+                    self.pc +% 1
+                ];
                 self.pc = self.pc +% 2;
                 // Increment PC by 2 to account for the two bytes of the address
                 self.ix = get_word_from_bytes(high_byte, low_byte);
             },
 
             .LD_IX__NN_ => {
-                const addr = get_word_from_bytes(ram[self.pc + 1], ram[self.pc]);
+                const addr = get_word_from_bytes(ram[
+                    self.pc +% 1
+                ], ram[self.pc]);
                 self.pc = self.pc +% 2;
                 // Increment PC by 1 to account for the low byte of the address
                 const low_byte = ram[addr];
@@ -1276,7 +1433,9 @@ pub const z80 = struct {
             },
 
             .LD__NN__IX => {
-                const addr = get_word_from_bytes(ram[self.pc + 1], ram[self.pc]);
+                const addr = get_word_from_bytes(ram[
+                    self.pc +% 1
+                ], ram[self.pc]);
                 self.pc = self.pc +% 2;
                 // Increment PC by 1 to account for the low byte of the address
                 ram[addr] = @truncate(self.ix & 0x00FF); // Low byte
@@ -1286,7 +1445,9 @@ pub const z80 = struct {
             .LD__IXD__N => {
                 const offset = ram[self.pc];
                 const addr = add_offset(self.ix, offset);
-                const value = ram[self.pc + 1];
+                const value = ram[
+                    self.pc +% 1
+                ];
                 self.pc = self.pc +% 2;
                 // skip offset and value
                 ram[addr] = value;
@@ -1306,7 +1467,7 @@ pub const z80 = struct {
                 const addr = add_offset(self.ix, offset);
                 self.pc = self.pc +% 1;
                 // skip offset
-                const value = self.get_register(@truncate((instruction & 0b00000111) >> 3));
+                const value = self.get_register(@truncate((instruction & 0b00000111)));
                 ram[addr] = value;
             },
 
@@ -1339,7 +1500,7 @@ pub const z80 = struct {
                 // Set flags
                 self.set_zsp(dec_value);
                 self.f.bits.pv = if (value == 0x80) 1 else 0; // Overflow if value was 0x80
-                self.f.bits.h = if ((value & 0x0F) == 0x0F) 1 else 0; // Check for half-borrow
+                self.f.bits.h = if ((dec_value & 0x0F) == 0x0F) 1 else 0; // Check for half-borrow
                 self.f.bits.n = 1; // Set subtraction flag
             },
 
@@ -1349,12 +1510,31 @@ pub const z80 = struct {
                 const value = ram[addr];
                 self.pc = self.pc +% 1;
                 // skip offset
-                const result = self.a +% value + (if (opcode == .ADC_A__IXD_) @as(u8, self.f.bits.c) else 0);
-                self.f.bits.c = if (result < self.a) 1 else 0; // Set carry if overflow
-                self.f.bits.h = if (((self.a & 0x0F) + (value & 0x0F)) > 0x0F) 1 else 0; // Check for half-carry
+                const carry_in: u8 = if (opcode == .ADC_A__IXD_) @as(u8, self.f.bits.c) else 0;
+                const result = self.a +% value +% carry_in;
+                self.f.bits.c = z80.calc_carry(8, self.a, value, carry_in);
+                self.f.bits.h = z80.calc_carry(4, self.a, value, carry_in);
+
                 self.f.bits.n = 0; // Clear subtraction flag
+                self.set_zsp(result); // Set ZSP based on result
+                self.set_pv_addition(self.a, value, result);
                 self.a = @truncate(result);
-                self.set_zsp(self.a); // Set ZSP based on result
+            },
+
+            .ADD_A_IXH, .ADD_A_IXL, .ADC_A_IXH, .ADC_A_IXL => {
+                const value: u8 = if (opcode == .ADD_A_IXH or opcode == .ADC_A_IXH)
+                    @truncate((self.ix & 0xFF00) >> 8) // IXH
+                else
+                    @truncate(self.ix & 0x00FF); // IXL
+                const carry_in: u8 = if (opcode == .ADC_A_IXH or opcode == .ADC_A_IXL) @as(u8, self.f.bits.c) else 0;
+                const result = self.a +% value +% carry_in;
+                //self.f.bits.c = if (result < self.a) 1 else 0; // Set carry if overflow
+                self.f.bits.c = z80.calc_carry(8, self.a, value, carry_in);
+                self.f.bits.h = z80.calc_carry(4, self.a, value, carry_in);
+                self.f.bits.n = 0; // Clear subtraction flag
+                self.set_zsp(result); // Set ZSP based on result
+                self.set_pv_addition(self.a, value, result);
+                self.a = @truncate(result);
             },
 
             .SUB__IXD_, .SBC_A__IXD_ => {
@@ -1363,21 +1543,34 @@ pub const z80 = struct {
                 const value = ram[addr];
                 self.pc = self.pc +% 1;
                 // skip offset
-                const borrow_in: u8 = if (opcode == .SBC_A__IXD_) @as(u8, self.f.bits.c) else 0;
-                const result = self.a -% (value +% borrow_in);
-                self.f.bits.c = if (self.a < (value +% borrow_in)) 1 else 0; // Set carry if underflow
-                self.f.bits.h = if ((self.a & 0x0F) < ((value & 0x0F) + borrow_in)) 1 else 0; // Check for half-borrow
-                self.f.bits.n = 1; // Set subtraction flag
-                self.a = @truncate(result);
-                self.set_zsp(self.a); // Set ZSP based on result
+                const with_borrow: bool = if (opcode == .SBC_A__IXD_) true else false;
+
+                self.subtract(value, with_borrow);
             },
 
-            .AND__IXD_ => {
-                const offset = ram[self.pc];
-                const addr = add_offset(self.ix, offset);
-                const value = ram[addr];
-                self.pc = self.pc +% 1;
-                // skip offset
+            .SUB_IXH, .SUB_IXL, .SBC_A_IXH, .SBC_A_IXL => {
+                const value: u8 = if (opcode == .SUB_IXH or opcode == .SBC_A_IXH)
+                    @truncate((self.ix & 0xFF00) >> 8) // IXH
+                else
+                    @truncate(self.ix & 0x00FF); // IXL
+                const with_borrow: bool = if (opcode == .SBC_A_IXH or opcode == .SBC_A_IXL) true else false;
+
+                self.subtract(value, with_borrow);
+            },
+
+            .AND__IXD_, .AND_IXH, .AND_IXL => {
+                var value: u8 = 0;
+                if (opcode == .AND__IXD_) {
+                    const offset = ram[self.pc];
+                    const addr = add_offset(self.ix, offset);
+                    value = ram[addr];
+                    self.pc = self.pc +% 1;
+                } else if (opcode == .AND_IXH) {
+                    value = @truncate((self.ix & 0xFF00) >> 8); // IXH
+                } else {
+                    value = @truncate(self.ix & 0x00FF); // IXL
+                }
+
                 self.a = self.a & value;
                 self.set_zsp(self.a);
                 self.f.bits.c = 0;
@@ -1385,12 +1578,19 @@ pub const z80 = struct {
                 self.f.bits.n = 0;
             },
 
-            .OR__IXD_ => {
-                const offset = ram[self.pc];
-                const addr = add_offset(self.ix, offset);
-                const value = ram[addr];
-                self.pc = self.pc +% 1;
-                // skip offset
+            .OR__IXD_, .OR_IXH, .OR_IXL => {
+                var value: u8 = 0;
+                if (opcode == .OR__IXD_) {
+                    const offset = ram[self.pc];
+                    const addr = add_offset(self.ix, offset);
+                    value = ram[addr];
+                    self.pc = self.pc +% 1;
+                } else if (opcode == .OR_IXH) {
+                    value = @truncate((self.ix & 0xFF00) >> 8); // IXH
+                } else {
+                    value = @truncate(self.ix & 0x00FF); // IXL
+                }
+
                 self.a = self.a | value;
                 self.set_zsp(self.a);
                 self.f.bits.c = 0;
@@ -1398,12 +1598,18 @@ pub const z80 = struct {
                 self.f.bits.n = 0;
             },
 
-            .XOR__IXD_ => {
-                const offset = ram[self.pc];
-                const addr = add_offset(self.ix, offset);
-                const value = ram[addr];
-                self.pc = self.pc +% 1;
-                // skip offset
+            .XOR__IXD_, .XOR_IXH, .XOR_IXL => {
+                var value: u8 = 0;
+                if (opcode == .XOR__IXD_) {
+                    const offset = ram[self.pc];
+                    const addr = add_offset(self.ix, offset);
+                    value = ram[addr];
+                    self.pc = self.pc +% 1;
+                } else if (opcode == .XOR_IXH) {
+                    value = @truncate((self.ix & 0xFF00) >> 8); // IXH
+                } else {
+                    value = @truncate(self.ix & 0x00FF); // IXL
+                }
                 self.a = self.a ^ value;
                 self.set_zsp(self.a);
                 self.f.bits.c = 0;
@@ -1411,17 +1617,25 @@ pub const z80 = struct {
                 self.f.bits.n = 0;
             },
 
-            .CP__IXD_ => {
-                const offset = ram[self.pc];
-                const addr = add_offset(self.ix, offset);
-                const value = ram[addr];
-                self.pc = self.pc +% 1;
-                // skip offset
+            .CP__IXD_, .CP_IXH, .CP_IXL => {
+                var value: u8 = 0;
+                if (opcode == .CP__IXD_) {
+                    const offset = ram[self.pc];
+                    const addr = add_offset(self.ix, offset);
+                    value = ram[addr];
+                    self.pc = self.pc +% 1;
+                } else if (opcode == .CP_IXH) {
+                    value = @truncate((self.ix & 0xFF00) >> 8); // IXH
+                } else {
+                    value = @truncate(self.ix & 0x00FF); // IXL
+                }
+
                 const result = self.a -% value;
                 self.f.bits.c = if (self.a < value) 1 else 0; // Set carry if underflow
                 self.f.bits.h = if ((self.a & 0x0F) < (value & 0x0F)) 1 else 0; // Check for half-borrow
                 self.f.bits.n = 1; // Set subtraction flag
                 self.set_zsp(@truncate(result)); // Set ZSP based on result
+                self.set_pv_subtraction(self.a, value, result);
             },
 
             .POP_IX => {
@@ -1433,10 +1647,10 @@ pub const z80 = struct {
             },
 
             .EX__SP_IX => {
-                const temp: u16 = (@as(u16, ram[self.sp + 1]) << 8) | ram[self.sp];
+                const temp: u16 = (@as(u16, ram[self.sp +% 1]) << 8) | ram[self.sp];
 
                 ram[self.sp] = @truncate(self.ix & 0x00FF); // Low byte
-                ram[self.sp + 1] = @truncate((self.ix & 0xFF00) >> 8); // High byte
+                ram[self.sp +% 1] = @truncate((self.ix & 0xFF00) >> 8); // High byte
                 self.ix = temp;
             },
 
@@ -1529,14 +1743,60 @@ pub const z80 = struct {
                 self.load_immediate_8bit(instruction, ram[0..]);
             },
 
+            .LD_B_IYH, .LD_B_IYL, .LD_C_IYH, .LD_C_IYL, .LD_D_IYH, .LD_D_IYL, .LD_E_IYH, .LD_E_IYL, .LD_A_IYH, .LD_A_IYL => {
+                // undocumented instructions
+                // --rrr-xx -> rrr = register, xx = hi (00) or lo (01)
+                const reg: u8 = @truncate((instruction & 0b00111000) >> 3);
+                const value: u8 = if ((instruction & 0b00000011) == 0b00)
+                    @truncate((self.iy & 0xFF00) >> 8) // IXH
+                else
+                    @truncate(self.iy & 0x00FF); // IXL
+                self.set_register(reg, value);
+            },
+            // ---xxrrr
+            // 01100000, 01100001, 01100010, 01100011, 01100111
+            // 01101000, 01101001, 01101010, 01101011, 01101111
+            .LD_IYH_B, .LD_IYH_C, .LD_IYH_D, .LD_IYH_E, .LD_IYH_A, .LD_IYL_B, .LD_IYL_C, .LD_IYL_D, .LD_IYL_E, .LD_IYL_A => {
+                // undocumented instructions
+                // @@@xxrrr -> rrr = register, xx = hi (00) or lo (01)
+                const reg: u8 = @truncate((instruction & 0b00000111));
+                const value: u8 = self.get_register(reg);
+                if ((instruction & 0b00011000) == 0b00) {
+                    // IYH
+                    self.iy = (self.iy & 0x00FF) | (@as(u16, value) << 8);
+                } else {
+                    // IYL
+                    self.iy = (self.iy & 0xFF00) | @as(u16, value);
+                }
+            },
+
+            .LD_IYH_IYH, .LD_IYL_IYL => {
+                return;
+            },
+
+            .LD_IYH_IYL => {
+                //const ixh: u8 = @truncate((self.ix & 0xFF00) >> 8);
+                const iyl: u8 = @truncate(self.iy & 0x00FF);
+                self.iy = (@as(u16, iyl) << 8) | @as(u16, iyl);
+            },
+
+            .LD_IYL_IYH => {
+                const iyh: u8 = @truncate((self.iy & 0xFF00) >> 8);
+                //const ixl: u8 = @truncate(self.ix & 0x00FF);
+                self.iy = (@as(u16, iyh)) | (@as(u16, iyh) << 8);
+            },
+
             .INC_IYH, .INC_IYL => {
                 var value: u8 = undefined;
+                var orig_iy: u8 = undefined;
                 if (opcode == .INC_IYH) {
                     value = @truncate((self.iy & 0xFF00) >> 8);
+                    orig_iy = value;
                     value = value +% 1;
                     self.iy = (self.iy & 0x00FF) | (@as(u16, value) << 8);
                 } else {
                     value = @truncate(self.iy & 0x00FF);
+                    orig_iy = value;
                     value = value +% 1;
                     self.iy = (self.iy & 0xFF00) | @as(u16, value);
                 }
@@ -1544,16 +1804,20 @@ pub const z80 = struct {
                 self.set_zsp(value);
                 self.f.bits.h = if ((value & 0x0F) == 0x00) 1 else 0; // Check for half-carry
                 self.f.bits.n = 0; // Clear subtraction flag
+                self.set_pv_addition(orig_iy, 1, value);
             },
 
             .DEC_IYH, .DEC_IYL => {
                 var value: u8 = undefined;
+                var orig_iy: u8 = undefined;
                 if (opcode == .DEC_IYH) {
                     value = @truncate((self.iy & 0xFF00) >> 8);
+                    orig_iy = value;
                     value = value -% 1;
                     self.iy = (self.iy & 0x00FF) | (@as(u16, value) << 8);
                 } else {
                     value = @truncate(self.iy & 0x00FF);
+                    orig_iy = value;
                     value = value -% 1;
                     self.iy = (self.iy & 0xFF00) | @as(u16, value);
                 }
@@ -1561,6 +1825,17 @@ pub const z80 = struct {
                 self.set_zsp(value);
                 self.f.bits.h = if ((value & 0x0F) == 0x0F) 1 else 0; // Check for half-borrow
                 self.f.bits.n = 1; // Set subtraction flag
+                self.set_pv_subtraction(orig_iy, 1, value);
+            },
+
+            .LD_IYH_N, .LD_IYL_N => {
+                const value = ram[self.pc];
+                self.pc = self.pc +% 1;
+                if (opcode == .LD_IYH_N) {
+                    self.iy = (self.iy & 0x00FF) | (@as(u16, value) << 8);
+                } else {
+                    self.iy = (self.iy & 0xFF00) | @as(u16, value);
+                }
             },
 
             .ADD_IY_BC, .ADD_IY_DE, .ADD_IY_IY, .ADD_IY_SP => {
@@ -1572,24 +1847,29 @@ pub const z80 = struct {
                     else => unreachable,
                 };
                 const IY = self.iy;
-                const result = IY +% value;
-                self.iy = result;
+
+                const result: u18 = @as(u18, IY) +% @as(u18, value);
+                self.iy = @truncate(result & 0xFFFF);
                 self.f.bits.c = if (result > 0xFFFF) 1 else 0; // Set carry if overflow
                 self.f.bits.h = if (((IY & 0x0FFF) + (value & 0x0FFF)) > 0x0FFF) 1 else 0; // Check for half-carry
                 self.f.bits.n = 0; // Clear subtraction flag
-                self.set_zsp(@truncate(result & 0xFF)); // Set ZSP based on lower byte of result
+
             },
 
             .LD_IY_NN => {
                 const low_byte = ram[self.pc];
-                const high_byte = ram[self.pc + 1];
+                const high_byte = ram[
+                    self.pc +% 1
+                ];
                 self.pc = self.pc +% 2;
                 // Increment PC by 2 to account for the two bytes of the address
                 self.iy = get_word_from_bytes(high_byte, low_byte);
             },
 
             .LD_IY__NN_ => {
-                const addr = get_word_from_bytes(ram[self.pc + 1], ram[self.pc]);
+                const addr = get_word_from_bytes(ram[
+                    self.pc +% 1
+                ], ram[self.pc]);
                 self.pc = self.pc +% 2;
                 // Increment PC by 1 to account for the low byte of the address
                 const low_byte = ram[addr];
@@ -1598,7 +1878,9 @@ pub const z80 = struct {
             },
 
             .LD__NN__IY => {
-                const addr = get_word_from_bytes(ram[self.pc + 1], ram[self.pc]);
+                const addr = get_word_from_bytes(ram[
+                    self.pc +% 1
+                ], ram[self.pc]);
                 self.pc = self.pc +% 2;
                 // Increment PC by 1 to account for the low byte of the address
                 ram[addr] = @truncate(self.iy & 0x00FF); // Low byte
@@ -1608,7 +1890,9 @@ pub const z80 = struct {
             .LD__IYD__N => {
                 const offset = ram[self.pc];
                 const addr = add_offset(self.iy, offset);
-                const value = ram[self.pc + 1];
+                const value = ram[
+                    self.pc +% 1
+                ];
                 self.pc = self.pc +% 2;
                 // skip offset and value
                 ram[addr] = value;
@@ -1628,7 +1912,7 @@ pub const z80 = struct {
                 const addr = add_offset(self.iy, offset);
                 self.pc = self.pc +% 1;
                 // skip offset
-                const value = self.get_register(@truncate((instruction & 0b00000111) >> 3));
+                const value = self.get_register(@truncate((instruction & 0b00000111)));
                 ram[addr] = value;
             },
 
@@ -1661,7 +1945,7 @@ pub const z80 = struct {
                 // Set flags
                 self.set_zsp(dec_value);
                 self.f.bits.pv = if (value == 0x80) 1 else 0; // Overflow if value was 0x80
-                self.f.bits.h = if ((value & 0x0F) == 0x0F) 1 else 0; // Check for half-borrow
+                self.f.bits.h = if ((dec_value & 0x0F) == 0x0F) 1 else 0; // Check for half-borrow
                 self.f.bits.n = 1; // Set subtraction flag
             },
 
@@ -1671,12 +1955,32 @@ pub const z80 = struct {
                 const value = ram[addr];
                 self.pc = self.pc +% 1;
                 // skip offset
-                const result = self.a +% value + (if (opcode == .ADC_A__IYD_) @as(u8, self.f.bits.c) else 0);
-                self.f.bits.c = if (result < self.a) 1 else 0; // Set carry if overflow
-                self.f.bits.h = if (((self.a & 0x0F) + (value & 0x0F)) > 0x0F) 1 else 0; // Check for half-carry
+
+                const carry_in: u8 = if (opcode == .ADC_A__IYD_) @as(u8, self.f.bits.c) else 0;
+                const result = self.a +% value +% carry_in;
+                self.f.bits.c = z80.calc_carry(8, self.a, value, carry_in);
+                self.f.bits.h = z80.calc_carry(4, self.a, value, carry_in);
+
                 self.f.bits.n = 0; // Clear subtraction flag
+                self.set_zsp(result); // Set ZSP based on result
+                self.set_pv_addition(self.a, value, result);
                 self.a = @truncate(result);
-                self.set_zsp(self.a); // Set ZSP based on result
+            },
+
+            .ADD_A_IYH, .ADD_A_IYL, .ADC_A_IYH, .ADC_A_IYL => {
+                const value: u8 = if (opcode == .ADD_A_IYH or opcode == .ADC_A_IYH)
+                    @truncate((self.iy & 0xFF00) >> 8) // IYH
+                else
+                    @truncate(self.iy & 0x00FF); // IYL
+                const carry_in: u8 = if (opcode == .ADC_A_IYH or opcode == .ADC_A_IYL) @as(u8, self.f.bits.c) else 0;
+                const result = self.a +% value +% carry_in;
+                //self.f.bits.c = if (result < self.a) 1 else 0; // Set carry if overflow
+                self.f.bits.c = z80.calc_carry(8, self.a, value, carry_in);
+                self.f.bits.h = z80.calc_carry(4, self.a, value, carry_in);
+                self.f.bits.n = 0; // Clear subtraction flag
+                self.set_zsp(result); // Set ZSP based on result
+                self.set_pv_addition(self.a, value, result);
+                self.a = @truncate(result);
             },
 
             .SUB__IYD_, .SBC_A__IYD_ => {
@@ -1685,21 +1989,34 @@ pub const z80 = struct {
                 const value = ram[addr];
                 self.pc = self.pc +% 1;
                 // skip offset
-                const borrow_in: u8 = if (opcode == .SBC_A__IYD_) @as(u8, self.f.bits.c) else 0;
-                const result = self.a -% (value +% borrow_in);
-                self.f.bits.c = if (self.a < (value +% borrow_in)) 1 else 0; // Set carry if underflow
-                self.f.bits.h = if ((self.a & 0x0F) < ((value & 0x0F) + borrow_in)) 1 else 0; // Check for half-borrow
-                self.f.bits.n = 1; // Set subtraction flag
-                self.a = @truncate(result);
-                self.set_zsp(self.a); // Set ZSP based on result
+                const with_borrow: bool = if (opcode == .SBC_A__IYD_) true else false;
+
+                self.subtract(value, with_borrow);
             },
 
-            .AND__IYD_ => {
-                const offset = ram[self.pc];
-                const addr = add_offset(self.iy, offset);
-                const value = ram[addr];
-                self.pc = self.pc +% 1;
-                // skip offset
+            .SUB_IYH, .SUB_IYL, .SBC_A_IYH, .SBC_A_IYL => {
+                const value: u8 = if (opcode == .SUB_IYH or opcode == .SBC_A_IYH)
+                    @truncate((self.iy & 0xFF00) >> 8) // IXH
+                else
+                    @truncate(self.iy & 0x00FF); // IXL
+                const with_borrow: bool = if (opcode == .SBC_A_IYH or opcode == .SBC_A_IYL) true else false;
+
+                self.subtract(value, with_borrow);
+            },
+
+            .AND__IYD_, .AND_IYH, .AND_IYL => {
+                var value: u8 = 0;
+                if (opcode == .AND__IYD_) {
+                    const offset = ram[self.pc];
+                    const addr = add_offset(self.iy, offset);
+                    value = ram[addr];
+                    self.pc = self.pc +% 1;
+                } else if (opcode == .AND_IYH) {
+                    value = @truncate((self.iy & 0xFF00) >> 8); // IXH
+                } else {
+                    value = @truncate(self.iy & 0x00FF); // IXL
+                }
+
                 self.a = self.a & value;
                 self.set_zsp(self.a);
                 self.f.bits.c = 0;
@@ -1707,12 +2024,19 @@ pub const z80 = struct {
                 self.f.bits.n = 0;
             },
 
-            .OR__IYD_ => {
-                const offset = ram[self.pc];
-                const addr = add_offset(self.iy, offset);
-                const value = ram[addr];
-                self.pc = self.pc +% 1;
-                // skip offset
+            .OR__IYD_, .OR_IYH, .OR_IYL => {
+                var value: u8 = 0;
+                if (opcode == .OR__IYD_) {
+                    const offset = ram[self.pc];
+                    const addr = add_offset(self.iy, offset);
+                    value = ram[addr];
+                    self.pc = self.pc +% 1;
+                } else if (opcode == .OR_IYH) {
+                    value = @truncate((self.iy & 0xFF00) >> 8); // IXH
+                } else {
+                    value = @truncate(self.iy & 0x00FF); // IXL
+                }
+
                 self.a = self.a | value;
                 self.set_zsp(self.a);
                 self.f.bits.c = 0;
@@ -1720,12 +2044,18 @@ pub const z80 = struct {
                 self.f.bits.n = 0;
             },
 
-            .XOR__IYD_ => {
-                const offset = ram[self.pc];
-                const addr = add_offset(self.iy, offset);
-                const value = ram[addr];
-                self.pc = self.pc +% 1;
-                // skip offset
+            .XOR__IYD_, .XOR_IYH, .XOR_IYL => {
+                var value: u8 = 0;
+                if (opcode == .XOR__IYD_) {
+                    const offset = ram[self.pc];
+                    const addr = add_offset(self.iy, offset);
+                    value = ram[addr];
+                    self.pc = self.pc +% 1;
+                } else if (opcode == .XOR_IYH) {
+                    value = @truncate((self.iy & 0xFF00) >> 8); // IXH
+                } else {
+                    value = @truncate(self.iy & 0x00FF); // IXL
+                }
                 self.a = self.a ^ value;
                 self.set_zsp(self.a);
                 self.f.bits.c = 0;
@@ -1733,17 +2063,25 @@ pub const z80 = struct {
                 self.f.bits.n = 0;
             },
 
-            .CP__IYD_ => {
-                const offset = ram[self.pc];
-                const addr = add_offset(self.iy, offset);
-                const value = ram[addr];
-                self.pc = self.pc +% 1;
-                // skip offset
+            .CP__IYD_, .CP_IYH, .CP_IYL => {
+                var value: u8 = 0;
+                if (opcode == .CP__IYD_) {
+                    const offset = ram[self.pc];
+                    const addr = add_offset(self.iy, offset);
+                    value = ram[addr];
+                    self.pc = self.pc +% 1;
+                } else if (opcode == .CP_IYH) {
+                    value = @truncate((self.iy & 0xFF00) >> 8); // IXH
+                } else {
+                    value = @truncate(self.iy & 0x00FF); // IXL
+                }
+
                 const result = self.a -% value;
                 self.f.bits.c = if (self.a < value) 1 else 0; // Set carry if underflow
                 self.f.bits.h = if ((self.a & 0x0F) < (value & 0x0F)) 1 else 0; // Check for half-borrow
                 self.f.bits.n = 1; // Set subtraction flag
                 self.set_zsp(@truncate(result)); // Set ZSP based on result
+                self.set_pv_subtraction(self.a, value, result);
             },
 
             .POP_IY => {
@@ -1755,10 +2093,10 @@ pub const z80 = struct {
             },
 
             .EX__SP_IY => {
-                const temp: u16 = (@as(u16, ram[self.sp + 1]) << 8) | ram[self.sp];
+                const temp: u16 = (@as(u16, ram[self.sp +% 1]) << 8) | ram[self.sp];
 
                 ram[self.sp] = @truncate(self.iy & 0x00FF); // Low byte
-                ram[self.sp + 1] = @truncate((self.iy & 0xFF00) >> 8); // High byte
+                ram[self.sp +% 1] = @truncate((self.iy & 0xFF00) >> 8); // High byte
                 self.iy = temp;
             },
 
@@ -1779,6 +2117,35 @@ pub const z80 = struct {
                 std.debug.print("Unimplemented IY opcode: {X}\n", .{instruction});
             },
         }
+    }
+
+    // if opcode is a prefix, check if the next opcode is affected by it
+    // if not, ignore the prefix and continue execution
+    fn skip_prefixes(prefix: u8, next_opcode: u8) bool {
+        if (prefix == 0xDD or prefix == 0xFD) {
+            // zig fmt: off
+            switch (next_opcode) {
+                0x00, 0x01, 0x02, 0x03, 0x07, 0x08, 0x0A, 0x0B, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x17, 0x18, 0x1A, 0x1B, 0x1F, 
+                0x20, 0x27, 0x28, 0x2F,
+                0x30, 0x31, 0x32, 0x33, 0x37, 0x38, 0x3A, 0x3B, 0x3F,
+                0x40, 0x41, 0x42, 0x43, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4F, 
+                0x50, 0x51, 0x52, 0x53, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5F, 
+                0x76, 0x78, 0x79, 0x7A, 0x7B, 0x7F, 
+                0x80, 0x81, 0x82, 0x83, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8F,
+                0x90, 0x91, 0x92, 0x93, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9F,
+                0xA0, 0xA1, 0xA2, 0xA3, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAF,
+                0xB0, 0xB1, 0xB2, 0xB3, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBF,
+                0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCC, 0xCD, 0xCE, 0xCF, 
+                0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
+                0xE0, 0xE2, 0xE4, 0xE6, 0xE7, 0xE8, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF, 
+                0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF  => {
+                // zig fmt: on
+                    return true; // skip prefix
+                },
+                else => return false,
+            }
+        }
+        return false;
     }
 
     // ********************************************************************************
@@ -1804,20 +2171,52 @@ pub const z80 = struct {
         //
         // handle interrupts
         //
-        if (self.interrupt_req == 1 and self.inte == 1) {
-            self.interrupt_req = 0; // lower interrupt req signal
-            self.inte = 0; // reset INTE
-            instruction = self.interrupt_vector; // opcode sent by interrupt req
+
+        // non-maskable interrupts are always accepted
+        if (self.non_maskable_int_req == 1) {
+            self.non_maskable_int_req = 0; // lower NMI signal
+            instruction = 0x66; // RST 28h
+        } else // maskable interrupts are only accepted if IFF1 is set
+        if (self.maskable_int_req == 1 and self.iff1 == 1) {
+            switch (self.interrupt_mode) {
+                0 => {
+                    // In IM 0, the CPU expects an instruction on the data bus.
+                    instruction = self.interrupt_vector;
+                },
+                1 => {
+                    instruction = 0xFF; // RST 38h
+                },
+                2 => {
+                    // In IM 2, the CPU forms an address from the I register and a byte on the data bus.
+                    const vector: u16 = (@as(u16, self.i) << 8) | self.interrupt_vector;
+                    const low_byte = ram[vector];
+                    const high_byte = ram[vector + 1];
+                    const addr = get_word_from_bytes(high_byte, low_byte);
+                    instruction = ram[addr];
+                },
+                else => unreachable,
+            }
         } else {
             // regular CPU cycle
             instruction = ram[self.pc];
             self.pc = self.pc +% 1;
+
+            // check if we have a prefix opcode that may change the instruction set
+            // if the instruction following the prefix is not affected by it, the prefix is ignored
+            if (skip_prefixes(instruction, ram[self.pc]) == true) {
+                self.r = (self.r & 0b10000000) | ((self.r +% 1) & 0b01111111);
+                // pick up next instruction
+                instruction = ram[self.pc];
+                self.pc = self.pc +% 1;
+            }
         }
 
         if (debug == true) {
             const stdout = std.io.getStdOut().writer();
 
-            stdout.print("{X:04}: {s} {X:02} {X:02} \t\t inst={X:02}, flags={X:02}, reg=[{X:02}|{X:02}|{X:02}|{X:02}|{X:02}|{X:02}|{X:02}]\n", .{ self.pc - 1, z80.opcode_names[instruction], ram[self.pc], ram[self.pc + 1], instruction, self.f.byte, self.b, self.c, self.d, self.e, self.h, self.l, self.a }) catch unreachable;
+            stdout.print("{X:04}: {s} {X:02} {X:02} \t\t inst={X:02}, flags={X:02}, reg=[{X:02}|{X:02}|{X:02}|{X:02}|{X:02}|{X:02}|{X:02}]\n", .{ self.pc - 1, z80.opcode_names[instruction], ram[self.pc], ram[
+                self.pc +% 1
+            ], instruction, self.f.byte, self.b, self.c, self.d, self.e, self.h, self.l, self.a }) catch unreachable;
         }
 
         self.r = (self.r & 0b10000000) | ((self.r +% 1) & 0b01111111);
@@ -1870,12 +2269,23 @@ pub const z80 = struct {
                 self.load_immediate_8bit(instruction, ram[0..]);
             },
 
+            .DJNZ_D => {
+                const offset = ram[self.pc];
+                self.pc = self.pc +% 1;
+                self.b = self.b -% 1;
+                if (self.b != 0) {
+                    self.pc = add_offset(self.pc, offset);
+                }
+            },
+
             // Rotate instructions
             // RLC: Rotate accumulator left w/ carry
             .RLCA => {
                 const msb = (self.a & 0x80) >> 7;
                 self.a = (self.a << 1) | msb;
                 self.f.bits.c = @truncate(msb);
+                self.f.bits.h = 0;
+                self.f.bits.n = 0;
             },
 
             // RAL: Rotate accumulator left through carry
@@ -1883,6 +2293,8 @@ pub const z80 = struct {
                 const msb = (self.a & 0x80) >> 7;
                 self.a = (self.a << 1) | self.f.bits.c;
                 self.f.bits.c = @truncate(msb);
+                self.f.bits.h = 0;
+                self.f.bits.n = 0;
             },
 
             // RRCA: Rotate accumulator right w/ carry
@@ -1890,6 +2302,8 @@ pub const z80 = struct {
                 const lsb = self.a & 0x01;
                 self.a = (self.a >> 1) | (lsb << 7);
                 self.f.bits.c = @truncate(lsb);
+                self.f.bits.h = 0;
+                self.f.bits.n = 0;
             },
 
             // RRA: Rotate accumulator right through carry
@@ -1897,6 +2311,8 @@ pub const z80 = struct {
                 const lsb = self.a & 0x01;
                 self.a = (self.a >> 1) | (@as(u8, self.f.bits.c) << 7);
                 self.f.bits.c = @truncate(lsb);
+                self.f.bits.h = 0;
+                self.f.bits.n = 0;
             },
 
             // DAA:
@@ -1938,15 +2354,19 @@ pub const z80 = struct {
 
             // LD (nn), HL: Store H and L into memory address provided in operands
             .LD__NN__HL => {
-                const addr = get_word_from_bytes(ram[self.pc + 1], ram[self.pc]);
+                const addr = get_word_from_bytes(ram[
+                    self.pc +% 1
+                ], ram[self.pc]);
                 ram[addr] = self.l;
-                ram[addr + 1] = self.h;
+                ram[addr +% 1] = self.h;
                 self.pc = self.pc +% 2;
             },
 
             // LD (HL), NN: Load H and L from memory address provided in operands
             .LD_HL__NN_ => {
-                const addr = get_word_from_bytes(ram[self.pc + 1], ram[self.pc]);
+                const addr = get_word_from_bytes(ram[
+                    self.pc +% 1
+                ], ram[self.pc]);
                 self.l = ram[addr];
                 self.h = ram[addr + 1];
                 self.pc = self.pc +% 2;
@@ -1955,11 +2375,15 @@ pub const z80 = struct {
             // CPL: Complement accumulator
             .CPL => {
                 self.a = ~self.a;
+                self.f.bits.n = 1;
+                self.f.bits.h = 1;
             },
 
             // STA: Store accumulator direct
             .LD__NN__A => {
-                const addr = get_word_from_bytes(ram[self.pc + 1], ram[self.pc]);
+                const addr = get_word_from_bytes(ram[
+                    self.pc +% 1
+                ], ram[self.pc]);
                 ram[addr] = self.a;
                 self.pc = self.pc +% 2;
             },
@@ -1967,16 +2391,22 @@ pub const z80 = struct {
             // STC: Set carry flag
             .SCF => {
                 self.f.bits.c = 1;
+                self.f.bits.n = 0;
+                self.f.bits.h = 0;
             },
 
             // CMC: Complement carry flag
             .CCF => {
+                self.f.bits.h = self.f.bits.c;
                 self.f.bits.c = if (self.f.bits.c == 0) 1 else 0;
+                self.f.bits.n = 0;
             },
 
             // LD A, (NN): Load accumulator direct
             .LD_A__NN_ => {
-                const addr = get_word_from_bytes(ram[self.pc + 1], ram[self.pc]);
+                const addr = get_word_from_bytes(ram[
+                    self.pc +% 1
+                ], ram[self.pc]);
                 self.a = ram[addr];
                 self.pc = self.pc +% 2;
             },
@@ -2043,13 +2473,33 @@ pub const z80 = struct {
                     else => unreachable,
                 };
                 if (condition) {
-                    const addr = get_word_from_bytes(ram[self.pc + 1], ram[self.pc]);
+                    const addr = get_word_from_bytes(ram[
+                        self.pc +% 1
+                    ], ram[self.pc]);
                     self.pc = addr;
                 } else {
                     self.pc = self.pc +% 2;
                     // Increment PC by 2 to skip the jump address
                 }
             },
+
+            .JR_D, .JR_NZ_D, .JR_Z_D, .JR_NC_D, .JR_C_D => {
+                const offset = ram[self.pc];
+                self.pc = self.pc +% 1;
+                // Increment PC by 1 to account for the offset byte
+                const condition = switch (opcode) {
+                    .JR_D => true,
+                    .JR_NZ_D => self.f.bits.z == 0,
+                    .JR_Z_D => self.f.bits.z == 1,
+                    .JR_NC_D => self.f.bits.c == 0,
+                    .JR_C_D => self.f.bits.c == 1,
+                    else => unreachable,
+                };
+                if (condition) {
+                    self.pc = add_offset(self.pc, offset);
+                }
+            },
+
             // CALLs: Call subroutine
             .CALL_NN,
             .CALL_NZ_NN,
@@ -2074,8 +2524,10 @@ pub const z80 = struct {
                     else => unreachable,
                 };
                 if (condition) {
-                    const addr = get_word_from_bytes(ram[self.pc + 1], ram[self.pc]);
-                    self.push(self.pc + 2, ram[0..]); // Push next instruction address
+                    const addr = get_word_from_bytes(ram[
+                        self.pc +% 1
+                    ], ram[self.pc]);
+                    self.push(self.pc +% 2, ram[0..]); // Push next instruction address
                     self.pc = addr; // Jump to subroutine address
                 } else {
                     self.pc = self.pc +% 2;
@@ -2093,8 +2545,11 @@ pub const z80 = struct {
                 self.set_zsp(result_u8);
                 self.f.bits.c = z80.calc_carry(8, self.a, value, carry_in);
                 self.f.bits.h = z80.calc_carry(4, self.a, value, carry_in);
+                self.set_pv_addition(self.a, value, result_u8);
+
                 self.a = result_u8; // Store result in accumulator
                 self.pc = self.pc +% 1;
+                self.f.bits.n = 0;
             },
 
             // RSTs: push PC to stack and jump to address 0000000000EXP00
@@ -2127,10 +2582,15 @@ pub const z80 = struct {
                 self.set_zsp(result_u8);
                 self.f.bits.c = if (result > 0xFF) 1 else 0; // Set carry if underflow
                 self.f.bits.h = if (((self.a & 0x0F) < (value & 0x0F) + borrow_in)) 1 else 0; // Check for half-borrow
+                self.set_pv_subtraction(self.a, value, result_u8);
                 self.a = result_u8; // Store result in accumulator
                 self.pc = self.pc +% 1;
+                self.f.bits.n = 1;
+
                 // Increment PC by 1 to account for the immediate data
             },
+
+            .SBC_A__HL_ => self.sbc_a_hl(ram[0..], true),
 
             // XTHL: Exchange stack top with HL
             .EX__SP__HL => {
@@ -2140,6 +2600,12 @@ pub const z80 = struct {
                 self.push(hl_value, ram[0..]); // Push old HL value onto stack
             },
 
+            .EX_AF_AF_ => {
+                const temp_af = self.get_register_pair(.AF);
+                self.set_register_pair(.AF, self.get_register_pair(.AF_));
+                self.set_register_pair(.AF_, temp_af);
+            },
+
             // ANI, ORI, XRI: Logical operations with immediate
             .AND_N, .OR_N, .XOR_N => {
                 const value: u8 = ram[self.pc];
@@ -2147,7 +2613,8 @@ pub const z80 = struct {
                     .AND_N => {
                         self.a = self.a & value; // AND operation
                         //self.f.bits.h = if ((self.a & 0x0F) < (value & 0x0F)) 1 else 0; // Check for half-carry
-                        self.f.bits.h = if ((self.a | value) & 0x08 != 0) 1 else 0;
+                        //self.f.bits.h = if ((self.a | value) & 0x08 != 0) 1 else 0;
+                        self.f.bits.h = 1; // AND always sets half-carry
                     },
                     .OR_N => {
                         self.a = self.a | value; // OR operation
@@ -2162,6 +2629,7 @@ pub const z80 = struct {
                 // Set flags
                 self.set_zsp(self.a);
                 self.f.bits.c = 0; // No carry for logical operations
+                self.f.bits.n = 0; // Clear subtraction flag
                 self.pc = self.pc +% 1;
                 // Increment PC by 1 to account for the immediate data
             },
@@ -2176,6 +2644,20 @@ pub const z80 = struct {
                 const de_value = self.get_register_pair(.DE);
                 self.set_register_pair(.HL, de_value);
                 self.set_register_pair(.DE, hl_value);
+            },
+
+            .EXX => {
+                const bc_value = self.get_register_pair(.BC);
+                const de_value = self.get_register_pair(.DE);
+                const hl_value = self.get_register_pair(.HL);
+
+                self.set_register_pair(.BC, self.get_register_pair(.BC_));
+                self.set_register_pair(.DE, self.get_register_pair(.DE_));
+                self.set_register_pair(.HL, self.get_register_pair(.HL_));
+
+                self.set_register_pair(.BC_, bc_value);
+                self.set_register_pair(.DE_, de_value);
+                self.set_register_pair(.HL_, hl_value);
             },
 
             // DI: Disable interrupts
@@ -2217,8 +2699,9 @@ pub const z80 = struct {
                 // Set flags
                 self.set_zsp(@truncate(result));
                 self.f.bits.c = if (result > 0xFF) 1 else 0; // Set carry if underflow
-                //self.f.bits.h = if (((self.a & 0x0F) < (value & 0x0F))) 1 else 0; // Check for half-borrow
-                self.f.bits.h = if (~((self.a ^ (result & 0xFF) ^ value) & 0x10) > 0) 1 else 0;
+                self.set_pv_subtraction(self.a, value, @truncate(result & 0xFF));
+                self.f.bits.h = if ((self.a & 0x0F) < (value & 0x0F)) 1 else 0;
+                self.f.bits.n = 1; // Set subtraction flag
             },
 
             // OUT
@@ -2238,19 +2721,21 @@ pub const z80 = struct {
 
             // z80 extensions
             .BIT => {
+                self.r = (self.r & 0b10000000) | ((self.r +% 1) & 0b01111111);
                 self.bit_instructions(ram[0..]);
             },
             .MISC => {
+                self.r = (self.r & 0b10000000) | ((self.r +% 1) & 0b01111111);
                 self.misc_instructions(ram[0..]);
             },
             .IX => {
+                self.r = (self.r & 0b10000000) | ((self.r +% 1) & 0b01111111);
                 self.ix_instructions(ram[0..]);
             },
             .IY => {
+                self.r = (self.r & 0b10000000) | ((self.r +% 1) & 0b01111111);
                 self.iy_instructions(ram[0..]);
             },
-
-            else => {},
         }
     }
 };
